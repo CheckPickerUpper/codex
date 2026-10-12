@@ -33,6 +33,47 @@ const WORKSPACE_ID_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174000";
 const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001";
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 
+behave::behave! {
+    "A shared process reads login changes from another process" {
+        tokio;
+
+        // @behavior managed-auth-observes-disk-refresh
+        // @boundary before=cached-fresh-token at=same-account-file-write after=next-public-auth-read
+        // @red stale fresh-token cache returns test-access-token instead of refreshed-access-token
+        // @green the next public authentication read adopts the same account's refreshed token
+        "A fresh cached login adopts a newer token for the same account" {
+            use behave::prelude::*;
+            let home = match tempdir() {
+                Ok(home) => home,
+                Err(failure) => return expect!(Some(failure)).to_be_none(),
+            };
+            expect!(write_auth_file(AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("plus".to_string()),
+                chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+            }, home.path())).to_be_ok()?;
+            let configuration = build_config(home.path(), None, None).await;
+            let manager = AuthManager::shared_from_auth_config(configuration, /*enable_codex_api_key_env*/ false).await;
+            expect!(manager.auth().await.map(|auth| auth.get_token())).to_be_some_and(
+                |token| matches!(token, Ok(token) if token == "test-access-token"), "initial stored token")?;
+            let storage = create_auth_storage(home.path().to_path_buf(), AuthCredentialsStoreMode::File,
+                                              AuthKeyringBackendKind::default());
+            expect!(super::persist_tokens(&storage, None, Some("refreshed-access-token".to_string()),
+                                           Some("refreshed-refresh-token".to_string()))).to_be_ok()?;
+            expect!(manager.auth().await.map(|auth| auth.get_token())).to_be_some_and(
+                |token| matches!(token, Ok(token) if token == "refreshed-access-token"), "new same-account token")?;
+
+            expect!(write_auth_file(AuthFileParams {
+                openai_api_key: None,
+                chatgpt_plan_type: Some("plus".to_string()),
+                chatgpt_account_id: Some(WORKSPACE_ID_DISALLOWED.to_string()),
+            }, home.path())).to_be_ok()?;
+            expect!(manager.auth().await.map(|auth| auth.get_token())).to_be_some_and(
+                |token| matches!(token, Ok(token) if token == "refreshed-access-token"), "original account retained")?;
+        }
+    }
+}
+
 #[test]
 fn header_auth_exposes_a_valid_chatgpt_account_id() {
     for (account_id_header, expected_account_id) in [
