@@ -45,7 +45,10 @@ behave::behave! {
             use behave::prelude::*;
             let home = match tempdir() {
                 Ok(home) => home,
-                Err(failure) => return expect!(Some(failure)).to_be_none(),
+                Err(failure) => {
+                    expect!(Some(failure)).to_be_none()?;
+                    return Ok(());
+                }
             };
             expect!(write_auth_file(AuthFileParams {
                 openai_api_key: None,
@@ -53,7 +56,13 @@ behave::behave! {
                 chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
             }, home.path())).to_be_ok()?;
             let configuration = build_config(home.path(), None, None).await;
-            let manager = AuthManager::shared_from_auth_config(configuration, /*enable_codex_api_key_env*/ false).await;
+            let manager = match AuthManager::shared_from_auth_config(configuration, /*enable_codex_api_key_env*/ false).await {
+                Ok(manager) => manager,
+                Err(failure) => {
+                    expect!(Some(failure)).to_be_none()?;
+                    return Ok(());
+                }
+            };
             expect!(manager.auth().await.map(|auth| auth.get_token())).to_be_some_and(
                 |token| matches!(token, Ok(token) if token == "test-access-token"), "initial stored token")?;
             let storage = create_auth_storage(home.path().to_path_buf(), AuthCredentialsStoreMode::File,
