@@ -50,11 +50,20 @@ behave::behave! {
                     return Ok(());
                 }
             };
-            expect!(write_auth_file(AuthFileParams {
-                openai_api_key: None,
-                chatgpt_plan_type: Some("plus".to_string()),
-                chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
-            }, home.path())).to_be_ok()?;
+            let storage = create_auth_storage(home.path().to_path_buf(), AuthCredentialsStoreMode::File,
+                                              AuthKeyringBackendKind::Direct);
+            let store_login = |account_id: &str| -> std::io::Result<()> {
+                write_auth_file(AuthFileParams {
+                    openai_api_key: None,
+                    chatgpt_plan_type: Some("plus".to_string()),
+                    chatgpt_account_id: Some(account_id.to_string()),
+                }, home.path())?;
+                let mut stored = storage.load()?.ok_or(std::io::Error::other("Fixture login was not stored"))?;
+                let tokens = stored.tokens.as_mut().ok_or(std::io::Error::other("Fixture login has no tokens"))?;
+                tokens.account_id = Some(account_id.to_string());
+                storage.save(&stored)
+            };
+            expect!(store_login(WORKSPACE_ID_ALLOWED)).to_be_ok()?;
             let configuration = build_config(home.path(), None, None).await;
             let manager = match AuthManager::shared_from_auth_config(configuration, /*enable_codex_api_key_env*/ false).await {
                 Ok(manager) => manager,
@@ -65,18 +74,12 @@ behave::behave! {
             };
             expect!(manager.auth().await.map(|auth| auth.get_token())).to_be_some_and(
                 |token| matches!(token, Ok(token) if token == "test-access-token"), "initial stored token")?;
-            let storage = create_auth_storage(home.path().to_path_buf(), AuthCredentialsStoreMode::File,
-                                              AuthKeyringBackendKind::default());
             expect!(super::persist_tokens(&storage, None, Some("refreshed-access-token".to_string()),
                                            Some("refreshed-refresh-token".to_string()))).to_be_ok()?;
             expect!(manager.auth().await.map(|auth| auth.get_token())).to_be_some_and(
                 |token| matches!(token, Ok(token) if token == "refreshed-access-token"), "new same-account token")?;
 
-            expect!(write_auth_file(AuthFileParams {
-                openai_api_key: None,
-                chatgpt_plan_type: Some("plus".to_string()),
-                chatgpt_account_id: Some(WORKSPACE_ID_DISALLOWED.to_string()),
-            }, home.path())).to_be_ok()?;
+            expect!(store_login(WORKSPACE_ID_DISALLOWED)).to_be_ok()?;
             expect!(manager.auth().await.map(|auth| auth.get_token())).to_be_some_and(
                 |token| matches!(token, Ok(token) if token == "refreshed-access-token"), "original account retained")?;
         }
