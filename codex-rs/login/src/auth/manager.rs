@@ -2384,9 +2384,9 @@ impl AuthManager {
         })
     }
 
-    /// Current cached auth (clone). May be `None` if not logged in or load failed.
-    /// For managed ChatGPT auth that needs a proactive refresh, first performs
-    /// a guarded reload and then refreshes only if the on-disk auth is unchanged.
+    /// Current auth (clone). May be `None` if not logged in or load failed.
+    /// Managed ChatGPT auth adopts stored changes for the same account before
+    /// applying the existing proactive token refresh policy.
     #[instrument(level = "trace", skip_all)]
     pub async fn auth(&self) -> Option<CodexAuth> {
         if self.has_external_auth() {
@@ -2394,6 +2394,17 @@ impl AuthManager {
             return self.auth_cached();
         }
 
+        let auth = self.auth_cached()?;
+        if matches!(auth, CodexAuth::Chatgpt(_)) {
+            let expected_account_id = auth.get_account_id();
+            if matches!(
+                self.reload_if_account_id_matches(expected_account_id.as_deref())
+                    .await,
+                ReloadOutcome::ReloadedChanged
+            ) {
+                tracing::info!("Adopted stored authentication for the same account.");
+            }
+        }
         let auth = self.auth_cached()?;
         if Self::should_refresh_proactively(&auth)
             && let Err(err) = self.refresh_token().await
