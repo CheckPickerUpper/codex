@@ -54,7 +54,10 @@ fn delegated_output_emits_only_first_preview_in_live_patch() {
             );
             sync.mark_pending_update_applied(&update);
         } else {
-            assert_eq!(update.and_then(|update| update.patch.preview), None);
+            assert!(
+                update.is_none(),
+                "later delegated output should coalesce its timestamp-only observation"
+            );
         }
     }
 }

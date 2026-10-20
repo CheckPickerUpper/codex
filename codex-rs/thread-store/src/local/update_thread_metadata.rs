@@ -55,18 +55,6 @@ pub(super) async fn update_thread_metadata(
             operation: "projects",
         });
     }
-    if patch.is_empty() {
-        return read_thread::read_thread(
-            store,
-            ReadThreadParams {
-                thread_id,
-                include_archived: params.include_archived,
-                include_history: false,
-            },
-        )
-        .await;
-    }
-
     let staged_requires_rollout_compat = pending_patch
         .as_ref()
         .is_some_and(|patch| patch.memory_mode.is_some() || patch.git_info.is_some());
@@ -94,6 +82,40 @@ pub(super) async fn update_thread_metadata(
         None
     };
     let paginated = matches!(history_mode, Some(ThreadHistoryMode::Paginated));
+    if let Some(name) = patch.name.as_ref()
+        && let Some(state_db) = store.state_db().await
+        && let Some(existing) =
+            state_db
+                .get_thread(thread_id)
+                .await
+                .map_err(|err| ThreadStoreError::Internal {
+                    message: format!("failed to read thread metadata for {thread_id}: {err}"),
+                })?
+    {
+        let unchanged = match (history_mode, existing.history_mode) {
+            (Some(ThreadHistoryMode::Paginated), ThreadHistoryMode::Paginated) => {
+                name == &existing.name
+            }
+            _ => false,
+        };
+        if unchanged {
+            patch.name = None;
+        }
+    }
+    if patch.is_empty() {
+        if pending_patch.is_some() {
+            remove_pending_thread_metadata(store, thread_id, &mut pending_metadata).await;
+        }
+        return read_thread::read_thread(
+            store,
+            ReadThreadParams {
+                thread_id,
+                include_archived: params.include_archived,
+                include_history: false,
+            },
+        )
+        .await;
+    }
     if paginated
         && patch.name.is_some()
         && live_writer::rollout_path(store, thread_id).await.is_ok()
@@ -461,9 +483,6 @@ async fn apply_metadata_update(
             if let Some(created_at) = patch.created_at {
                 metadata.created_at = created_at;
             }
-            if let Some(updated_at) = patch.updated_at {
-                metadata.updated_at = updated_at;
-            }
             if existing.is_none()
                 && let Some(recency_at) = advance_recency_at
             {
@@ -521,6 +540,34 @@ async fn apply_metadata_update(
             }
             if let Some(daybreak_enabled) = patch.daybreak_enabled {
                 metadata.daybreak_enabled = Some(daybreak_enabled);
+            }
+            // Equal observations carry activity, but do not change indexed metadata facts.
+            if existing.as_ref() == Some(&metadata)
+                && patch.name.is_none()
+                && patch.memory_mode.is_none()
+                && project_id.is_none()
+                && patch.daybreak_enabled.is_none()
+                && advance_recency_at.is_none()
+            {
+                match patch.updated_at {
+                    None => return Ok(()),
+                    Some(updated_at) => {
+                        if state_db
+                            .touch_thread_updated_at(thread_id, updated_at)
+                            .await
+                            .map_err(|err| ThreadStoreError::Internal {
+                                message: format!(
+                                    "failed to update thread timestamp for {thread_id}: {err}"
+                                ),
+                            })?
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if let Some(updated_at) = patch.updated_at {
+                metadata.updated_at = updated_at;
             }
             let upsert_result = state_db.upsert_thread(&metadata).await;
             if existing.is_none()
@@ -1147,6 +1194,7 @@ mod tests {
     async fn paginated_name_updates_use_sqlite_without_rollout_writes() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
+        let sqlite = config.sqlite.clone();
         let uuid = Uuid::from_u128(318);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
         let path = write_session_file_with_history_mode(
@@ -1192,6 +1240,46 @@ mod tests {
                 .as_deref(),
             Some("Canonical paginated name")
         );
+
+        let observer = sqlite
+            .open_read_write_pool(&sqlite.state_db_path())
+            .await
+            .expect("open SQLite observer");
+        sqlx::raw_sql(
+            "CREATE TABLE metadata_writes (kind TEXT);\n\
+             CREATE TRIGGER count_metadata_writes AFTER UPDATE ON threads\n\
+             BEGIN INSERT INTO metadata_writes VALUES ('update'); END;",
+        )
+        .execute(&observer)
+        .await
+        .expect("observe metadata writes");
+        let session_index_path = home.path().join("session_index.jsonl");
+        let original_index = std::fs::read(&session_index_path).expect("read name index");
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(metadata.name.clone()),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("repeat the existing name");
+        assert_eq!(
+            runtime.get_thread(thread_id).await.expect("read metadata"),
+            Some(metadata)
+        );
+        let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_writes")
+            .fetch_one(&observer)
+            .await
+            .expect("count metadata writes");
+        assert_eq!(writes, 0);
+        assert_eq!(
+            std::fs::read(&session_index_path).expect("read repeated name index"),
+            original_index
+        );
+        observer.close().await;
 
         let thread = store
             .update_thread_metadata(UpdateThreadMetadataParams {
@@ -1242,6 +1330,38 @@ mod tests {
             std::fs::read_to_string(&path).expect("read rollout"),
             original_rollout
         );
+
+        std::fs::remove_dir(&session_index_path).expect("restore legacy name index");
+        let legacy_uuid = Uuid::from_u128(319);
+        let legacy_id = ThreadId::from_string(&legacy_uuid.to_string()).expect("legacy thread id");
+        write_session_file(home.path(), "2025-01-03T14-16-00", legacy_uuid)
+            .expect("legacy session file");
+        for name in ["Renamed legacy thread", "Hello from user"] {
+            store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id: legacy_id,
+                    patch: ThreadMetadataPatch {
+                        title: Some("Hello from user".to_string()),
+                        ..Default::default()
+                    },
+                    include_archived: false,
+                })
+                .await
+                .expect("observe the derived legacy title");
+            let thread = store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id: legacy_id,
+                    patch: ThreadMetadataPatch {
+                        name: Some(Some(name.to_string())),
+                        ..Default::default()
+                    },
+                    include_archived: false,
+                })
+                .await
+                .expect("set legacy name even when it matches the derived title")
+                .expect("legacy thread");
+            assert_eq!(thread.name.as_deref(), Some(name));
+        }
     }
 
     #[tokio::test]

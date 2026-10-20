@@ -31,6 +31,14 @@ const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
 #[path = "thread_metadata_sync_preview_tests.rs"]
 mod preview_tests;
 
+/// Token total last confirmed in the metadata store.
+enum PersistedTokenTotal {
+    /// No successful write or stored total has been observed.
+    Unobserved,
+    /// The last successfully stored total.
+    Known(i64),
+}
+
 /// Live-thread helper that derives metadata updates from appended rollout items.
 ///
 /// Stores receive raw rollout items plus explicit metadata patches. This helper
@@ -45,6 +53,7 @@ pub(crate) struct ThreadMetadataSync {
     pending_update: Option<ThreadMetadataPatch>,
     pending_update_generation: u64,
     last_touch_persisted_at: Option<Instant>,
+    persisted_token_total: PersistedTokenTotal,
     defer_create_update_until_history_exists: bool,
     defer_resume_update_until_append: bool,
 }
@@ -99,6 +108,7 @@ impl ThreadMetadataSync {
             pending_update: Some(update),
             pending_update_generation: 1,
             last_touch_persisted_at: None,
+            persisted_token_total: PersistedTokenTotal::Unobserved,
             defer_create_update_until_history_exists: true,
             defer_resume_update_until_append: false,
         }
@@ -131,6 +141,10 @@ impl ThreadMetadataSync {
             pending_update: None,
             pending_update_generation: 0,
             last_touch_persisted_at: None,
+            persisted_token_total: match metadata {
+                Some(metadata) => PersistedTokenTotal::Known(metadata.tokens_used),
+                None => PersistedTokenTotal::Unobserved,
+            },
             defer_create_update_until_history_exists: false,
             defer_resume_update_until_append: false,
         };
@@ -174,6 +188,13 @@ impl ThreadMetadataSync {
         if update.patch.updated_at.is_some() {
             self.last_touch_persisted_at = Some(Instant::now());
         }
+        match update.patch.token_usage.as_ref() {
+            Some(usage) if self.pending_update_generation == update.generation => {
+                self.persisted_token_total = PersistedTokenTotal::Known(usage.total_tokens.max(0));
+            }
+            Some(_) => self.persisted_token_total = PersistedTokenTotal::Unobserved,
+            None => {}
+        }
     }
 
     pub(crate) fn observe_appended_items(
@@ -197,11 +218,21 @@ impl ThreadMetadataSync {
             update.advance_recency_at = Some(Utc::now());
         }
         self.merge_pending_update(Some(update));
-        if !affects_metadata
-            && !self
-                .pending_update
-                .as_ref()
-                .is_some_and(update_has_metadata_facts)
+        match (&mut self.pending_update, &self.persisted_token_total) {
+            (Some(pending), PersistedTokenTotal::Known(total))
+                if pending
+                    .token_usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.total_tokens.max(0) == *total) =>
+            {
+                pending.token_usage = None;
+            }
+            _ => {}
+        }
+        if !self
+            .pending_update
+            .as_ref()
+            .is_some_and(update_has_metadata_facts)
             && self.last_touch_persisted_at.is_some_and(|last_touch| {
                 Instant::now().duration_since(last_touch) < THREAD_UPDATED_AT_TOUCH_INTERVAL
             })
