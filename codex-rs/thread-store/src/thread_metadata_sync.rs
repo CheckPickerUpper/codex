@@ -13,6 +13,7 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::protocol::user_message_preview;
@@ -31,12 +32,12 @@ const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
 #[path = "thread_metadata_sync_preview_tests.rs"]
 mod preview_tests;
 
-/// Token total last confirmed in the metadata store.
-enum PersistedTokenTotal {
-    /// No successful write or stored total has been observed.
-    Unobserved,
-    /// The last successfully stored total.
-    Known(i64),
+/// Complete token usage last accepted by this live thread's metadata store.
+enum AcknowledgedTokenUsage {
+    /// No complete accepted observation is known.
+    Unknown,
+    /// The accepted command may still require the store's durability fence.
+    Known(TokenUsage),
 }
 
 /// Live-thread helper that derives metadata updates from appended rollout items.
@@ -53,7 +54,7 @@ pub(crate) struct ThreadMetadataSync {
     pending_update: Option<ThreadMetadataPatch>,
     pending_update_generation: u64,
     last_touch_persisted_at: Option<Instant>,
-    persisted_token_total: PersistedTokenTotal,
+    acknowledged_token_usage: AcknowledgedTokenUsage,
     defer_create_update_until_history_exists: bool,
     defer_resume_update_until_append: bool,
 }
@@ -108,7 +109,7 @@ impl ThreadMetadataSync {
             pending_update: Some(update),
             pending_update_generation: 1,
             last_touch_persisted_at: None,
-            persisted_token_total: PersistedTokenTotal::Unobserved,
+            acknowledged_token_usage: AcknowledgedTokenUsage::Unknown,
             defer_create_update_until_history_exists: true,
             defer_resume_update_until_append: false,
         }
@@ -141,10 +142,8 @@ impl ThreadMetadataSync {
             pending_update: None,
             pending_update_generation: 0,
             last_touch_persisted_at: None,
-            persisted_token_total: match metadata {
-                Some(metadata) => PersistedTokenTotal::Known(metadata.tokens_used),
-                None => PersistedTokenTotal::Unobserved,
-            },
+            // Stored metadata has only a total, not the complete usage accepted by a store.
+            acknowledged_token_usage: AcknowledgedTokenUsage::Unknown,
             defer_create_update_until_history_exists: false,
             defer_resume_update_until_append: false,
         };
@@ -181,6 +180,16 @@ impl ThreadMetadataSync {
         self.take_pending_update()
     }
 
+    /// Invalidates old equality evidence before a write can change token usage.
+    ///
+    /// Pending observations stay owned until acknowledgement, including after an error or
+    /// cancellation while the store operation is being awaited.
+    pub(crate) fn begin_metadata_update(&mut self, patch: &ThreadMetadataPatch) {
+        if patch.token_usage.is_some() {
+            self.acknowledged_token_usage = AcknowledgedTokenUsage::Unknown;
+        }
+    }
+
     pub(crate) fn mark_pending_update_applied(&mut self, update: &PendingThreadMetadataPatch) {
         if self.pending_update_generation == update.generation {
             self.pending_update = None;
@@ -190,9 +199,9 @@ impl ThreadMetadataSync {
         }
         match update.patch.token_usage.as_ref() {
             Some(usage) if self.pending_update_generation == update.generation => {
-                self.persisted_token_total = PersistedTokenTotal::Known(usage.total_tokens.max(0));
+                self.acknowledged_token_usage = AcknowledgedTokenUsage::Known(usage.clone());
             }
-            Some(_) => self.persisted_token_total = PersistedTokenTotal::Unobserved,
+            Some(_) => self.acknowledged_token_usage = AcknowledgedTokenUsage::Unknown,
             None => {}
         }
     }
@@ -218,12 +227,9 @@ impl ThreadMetadataSync {
             update.advance_recency_at = Some(Utc::now());
         }
         self.merge_pending_update(Some(update));
-        match (&mut self.pending_update, &self.persisted_token_total) {
-            (Some(pending), PersistedTokenTotal::Known(total))
-                if pending
-                    .token_usage
-                    .as_ref()
-                    .is_some_and(|usage| usage.total_tokens.max(0) == *total) =>
+        match (&mut self.pending_update, &self.acknowledged_token_usage) {
+            (Some(pending), AcknowledgedTokenUsage::Known(acknowledged_usage))
+                if pending.token_usage.as_ref() == Some(acknowledged_usage) =>
             {
                 pending.token_usage = None;
             }

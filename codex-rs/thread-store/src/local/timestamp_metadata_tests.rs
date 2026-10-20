@@ -6,6 +6,7 @@ use super::*;
 use chrono::Utc;
 use codex_protocol::protocol::ThreadMemoryMode;
 use pretty_assertions::assert_eq;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn timestamp_updates_repair_missing_rows_then_touch_only_timestamp_columns() {
@@ -23,7 +24,7 @@ async fn timestamp_updates_repair_missing_rows_then_touch_only_timestamp_columns
             .open_read_write_pool(&config.sqlite.state_db_path())
             .await
             .expect("open SQL observer");
-        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
         let id = uuid::Uuid::new_v4();
         let thread_id = ThreadId::from_string(&id.to_string()).expect("thread id");
         let path = write_session_file_with_history_mode(
@@ -146,19 +147,20 @@ async fn timestamp_updates_repair_missing_rows_then_touch_only_timestamp_columns
         writes.sort();
         assert_eq!(writes, vec!["full", "timestamp", "timestamp", "timestamp"]);
 
-        let mut sync = crate::thread_metadata_sync::ThreadMetadataSync::for_resume(
-            &ResumeThreadParams {
-                thread_id,
-                rollout_path: Some(path),
-                history: None,
-                history_revision: None,
-                include_archived: false,
-                metadata: crate::ThreadPersistenceMetadata {
-                    cwd: None,
-                    model_provider: expected.model_provider.clone(),
-                    memory_mode: ThreadMemoryMode::Enabled,
-                },
+        let resume_params = ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(path.clone()),
+            history: None,
+            history_revision: None,
+            include_archived: false,
+            metadata: crate::ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: expected.model_provider.clone(),
+                memory_mode: ThreadMemoryMode::Enabled,
             },
+        };
+        let mut sync = crate::thread_metadata_sync::ThreadMetadataSync::for_resume(
+            &resume_params,
             Some(&actual),
         );
         let token_count = |total_tokens| {
@@ -280,6 +282,59 @@ async fn timestamp_updates_repair_missing_rows_then_touch_only_timestamp_columns
                 .tokens_used,
             44
         );
+
+        let (live, _) = crate::LiveThread::resume(store, history_mode, resume_params)
+            .await
+            .expect("resume live thread for physical path repair");
+        live.append_items(&[token_count(42)])
+            .await
+            .expect("record live token usage");
+        live.flush()
+            .await
+            .expect("flush live usage before path repair");
+        let parent = path.parent().expect("rollout parent");
+        let alternate_path = parent
+            .join("..")
+            .join(parent.file_name().expect("rollout directory name"))
+            .join(path.file_name().expect("rollout file name"));
+        live.update_metadata(
+            ThreadMetadataPatch {
+                rollout_path: Some(alternate_path),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect("set an equivalent physical path spelling");
+        let mut expected_repair = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read metadata before physical repair")
+            .expect("existing thread metadata");
+        assert_ne!(expected_repair.rollout_path, path);
+        expected_repair.rollout_path = path;
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE path_repair_token_writes(kind TEXT);
+            CREATE TRIGGER count_path_repair_tokens AFTER UPDATE OF tokens_used ON threads
+            BEGIN INSERT INTO path_repair_token_writes VALUES ('tokens'); END;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("observe token writes during physical path repair");
+        live.flush().await.expect("repair live rollout path");
+        let actual_repair = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read repaired physical path")
+            .expect("existing repaired metadata");
+        let token_writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM path_repair_token_writes")
+            .fetch_one(&pool)
+            .await
+            .expect("count token writes during physical path repair");
+        assert_eq!((actual_repair, token_writes), (expected_repair, 0));
+        live.shutdown().await.expect("shutdown path repair fixture");
         pool.close().await;
     }
 }

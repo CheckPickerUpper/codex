@@ -264,24 +264,29 @@ async fn sync_materialized_rollout_path(
         return Ok(());
     };
     let result: ThreadStoreResult<()> = async {
-        let Some(mut metadata) =
-            state_db
-                .get_thread(thread_id)
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to read thread metadata for {thread_id}: {err}"),
-                })?
+        let Some(stored_rollout_path) = state_db
+            .find_rollout_path_by_id(thread_id, None)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to read thread metadata for {thread_id}: {err}"),
+            })?
         else {
             return Ok(());
         };
-        if metadata.rollout_path != rollout_path {
-            metadata.rollout_path = rollout_path.to_path_buf();
-            state_db
-                .upsert_thread(&metadata)
+        if stored_rollout_path != rollout_path {
+            let replaced = state_db
+                .replace_rollout_path_if_current(thread_id, &stored_rollout_path, rollout_path)
                 .await
                 .map_err(|err| ThreadStoreError::Internal {
                     message: format!("failed to update thread metadata for {thread_id}: {err}"),
                 })?;
+            if !replaced {
+                return Err(ThreadStoreError::Conflict {
+                    message: format!(
+                        "thread {thread_id} changed while its rollout path was being synchronized"
+                    ),
+                });
+            }
         }
         Ok(())
     }

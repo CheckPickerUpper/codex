@@ -39,6 +39,7 @@ pub struct LiveThread {
     thread_id: ThreadId,
     history_mode: ThreadHistoryMode,
     thread_store: Arc<dyn ThreadStore>,
+    // Keep observation and its store acknowledgement under the same writer ownership.
     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
     persistence_telemetry: RolloutPersistenceTelemetry,
 }
@@ -222,12 +223,10 @@ impl LiveThread {
         if items.is_empty() {
             return Ok(());
         }
-        let update = self
-            .metadata_sync
-            .lock()
-            .await
-            .observe_appended_items(items.as_slice());
+        let mut metadata_sync = Arc::clone(&self.metadata_sync).lock_owned().await;
+        let update = metadata_sync.observe_appended_items(items.as_slice());
         if let Some(update) = update {
+            metadata_sync.begin_metadata_update(&update.patch);
             self.thread_store
                 .record_thread_metadata(UpdateThreadMetadataParams {
                     thread_id: self.thread_id,
@@ -235,10 +234,7 @@ impl LiveThread {
                     include_archived: true,
                 })
                 .await?;
-            self.metadata_sync
-                .lock()
-                .await
-                .mark_pending_update_applied(&update);
+            metadata_sync.mark_pending_update_applied(&update);
         }
         Ok(())
     }
@@ -273,18 +269,18 @@ impl LiveThread {
 
     pub async fn persist(&self, context: PersistContext) -> ThreadStoreResult<()> {
         if context.allows_background_persistence() {
-            let update = self
-                .metadata_sync
-                .lock()
-                .await
-                .take_pending_update_for_existing_history();
-            self.apply_pending_metadata_update(update, context).await?;
+            let mut metadata_sync = Arc::clone(&self.metadata_sync).lock_owned().await;
+            let update = metadata_sync.take_pending_update_for_existing_history();
+            self.apply_pending_metadata_update(&mut metadata_sync, update, context)
+                .await?;
         }
         self.thread_store
             .persist_thread(self.thread_id, context)
             .await?;
-        let update = self.metadata_sync.lock().await.take_pending_update();
-        self.apply_pending_metadata_update(update, context).await
+        let mut metadata_sync = Arc::clone(&self.metadata_sync).lock_owned().await;
+        let update = metadata_sync.take_pending_update();
+        self.apply_pending_metadata_update(&mut metadata_sync, update, context)
+            .await
     }
 
     pub async fn flush(&self) -> ThreadStoreResult<()> {
@@ -344,7 +340,10 @@ impl LiveThread {
         mode: ThreadMemoryMode,
         include_archived: bool,
     ) -> ThreadStoreResult<()> {
-        self.flush_pending_metadata_update().await?;
+        let mut metadata_sync = Arc::clone(&self.metadata_sync).lock_owned().await;
+        let update = metadata_sync.take_pending_update();
+        self.apply_pending_metadata_update(&mut metadata_sync, update, PersistContext::Standard)
+            .await?;
         self.thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
@@ -367,7 +366,11 @@ impl LiveThread {
         patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
-        self.flush_pending_metadata_update().await?;
+        let mut metadata_sync = Arc::clone(&self.metadata_sync).lock_owned().await;
+        let update = metadata_sync.take_pending_update();
+        self.apply_pending_metadata_update(&mut metadata_sync, update, PersistContext::Standard)
+            .await?;
+        metadata_sync.begin_metadata_update(&patch);
         let updated = self
             .thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
@@ -376,6 +379,7 @@ impl LiveThread {
                 include_archived,
             })
             .await?;
+        drop(metadata_sync);
         match updated {
             Some(thread) => Ok(thread),
             None => {
@@ -402,30 +406,23 @@ impl LiveThread {
             .map(Some)
     }
 
-    async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {
-        let update = self.metadata_sync.lock().await.take_pending_update();
-        self.apply_pending_metadata_update(update, PersistContext::Standard)
-            .await
-    }
-
     async fn flush_pending_metadata_update_for_existing_history(&self) -> ThreadStoreResult<()> {
-        let update = self
-            .metadata_sync
-            .lock()
-            .await
-            .take_pending_update_for_existing_history();
-        self.apply_pending_metadata_update(update, PersistContext::Standard)
+        let mut metadata_sync = Arc::clone(&self.metadata_sync).lock_owned().await;
+        let update = metadata_sync.take_pending_update_for_existing_history();
+        self.apply_pending_metadata_update(&mut metadata_sync, update, PersistContext::Standard)
             .await
     }
 
     async fn apply_pending_metadata_update(
         &self,
+        metadata_sync: &mut ThreadMetadataSync,
         update: Option<crate::thread_metadata_sync::PendingThreadMetadataPatch>,
         context: PersistContext,
     ) -> ThreadStoreResult<()> {
         let Some(update) = update else {
             return Ok(());
         };
+        metadata_sync.begin_metadata_update(&update.patch);
         let params = UpdateThreadMetadataParams {
             thread_id: self.thread_id,
             patch: update.patch.clone(),
@@ -436,10 +433,7 @@ impl LiveThread {
         } else {
             self.thread_store.record_thread_metadata(params).await?;
         }
-        self.metadata_sync
-            .lock()
-            .await
-            .mark_pending_update_applied(&update);
+        metadata_sync.mark_pending_update_applied(&update);
         Ok(())
     }
 }

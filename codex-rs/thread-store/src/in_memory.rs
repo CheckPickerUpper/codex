@@ -412,7 +412,13 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_update_returns_the_materialized_thread() {
-        let store = InMemoryThreadStore::default();
+        use codex_protocol::protocol::EventMsg;
+        use codex_protocol::protocol::TokenCountEvent;
+        use codex_protocol::protocol::TokenUsage;
+        use codex_protocol::protocol::TokenUsageInfo;
+        use std::task::Poll;
+
+        let store = Arc::new(InMemoryThreadStore::default());
         let thread_id = ThreadId::default();
         store
             .create_thread(create_thread_params(thread_id, ThreadHistoryMode::Legacy))
@@ -420,7 +426,7 @@ mod tests {
             .expect("create thread");
 
         let updated = ThreadStore::update_thread_metadata(
-            &store,
+            store.as_ref(),
             UpdateThreadMetadataParams {
                 thread_id,
                 patch: ThreadMetadataPatch {
@@ -435,6 +441,112 @@ mod tests {
         let updated = updated.expect("in-memory store returns updated thread");
         assert_eq!(updated.thread_id, thread_id);
         assert_eq!(updated.name.as_deref(), Some("renamed"));
+
+        let live = crate::LiveThread::create(
+            store.clone(),
+            create_thread_params(ThreadId::new(), ThreadHistoryMode::Legacy),
+        )
+        .await
+        .expect("create live thread");
+        let token_count = |usage| {
+            RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                info: Some(TokenUsageInfo {
+                    total_token_usage: usage,
+                    last_token_usage: TokenUsage::default(),
+                    model_context_window: None,
+                }),
+                rate_limits: None,
+            }))
+        };
+        let original_usage = TokenUsage {
+            input_tokens: 8,
+            output_tokens: 2,
+            total_tokens: 10,
+            ..Default::default()
+        };
+        let changed_usage = TokenUsage {
+            input_tokens: 7,
+            output_tokens: 3,
+            ..original_usage.clone()
+        };
+        live.append_items(&[token_count(original_usage)])
+            .await
+            .expect("record initial usage breakdown");
+        live.append_items(&[token_count(changed_usage.clone())])
+            .await
+            .expect("record changed usage breakdown with the same total");
+        live.flush().await.expect("flush changed usage breakdown");
+        let observed_breakdown = live
+            .read_thread(false, false)
+            .await
+            .expect("read changed usage breakdown")
+            .token_usage;
+
+        live.update_metadata(
+            ThreadMetadataPatch {
+                token_usage: Some(TokenUsage {
+                    total_tokens: 11,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect("apply explicit token metadata update");
+        live.append_items(&[token_count(changed_usage.clone())])
+            .await
+            .expect("record usage after explicit metadata update");
+        let observed_after_explicit_update = live
+            .read_thread(false, false)
+            .await
+            .expect("read usage after explicit metadata update")
+            .token_usage;
+
+        let latest_usage = TokenUsage {
+            total_tokens: 42,
+            ..Default::default()
+        };
+        live.append_items(&[token_count(latest_usage.clone())])
+            .await
+            .expect("persist baseline usage");
+        let older_items = [token_count(TokenUsage {
+            total_tokens: 43,
+            ..Default::default()
+        })];
+        let latest_items = [token_count(latest_usage.clone())];
+        let storage_gate = Arc::clone(&store.state).lock_owned().await;
+        let mut older_append = Box::pin(live.append_items(&older_items));
+        let mut latest_append = Box::pin(live.append_items(&latest_items));
+        assert!(futures::poll!(older_append.as_mut()).is_pending());
+        assert!(futures::poll!(latest_append.as_mut()).is_pending());
+        drop(storage_gate);
+        // Both raw appends queue before the older metadata write reaches the real store.
+        assert!(futures::poll!(older_append.as_mut()).is_pending());
+        let latest_completion = futures::poll!(latest_append.as_mut());
+        older_append.await.expect("finish older metadata write");
+        match latest_completion {
+            Poll::Ready(completion) => completion.expect("finish latest append"),
+            Poll::Pending => latest_append.await.expect("finish latest append"),
+        }
+        live.flush().await.expect("flush latest observed usage");
+        let observed_latest = live
+            .read_thread(false, false)
+            .await
+            .expect("read latest usage after overlapping writes")
+            .token_usage;
+        assert_eq!(
+            (
+                observed_breakdown,
+                observed_after_explicit_update,
+                observed_latest
+            ),
+            (
+                Some(changed_usage.clone()),
+                Some(changed_usage),
+                Some(latest_usage)
+            )
+        );
     }
 
     fn create_thread_params(
